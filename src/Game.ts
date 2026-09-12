@@ -22,6 +22,11 @@ interface Drag {
   dy: number;
   x: number;
   y: number;
+  px: number;
+  py: number;
+  pt: number;
+  vx: number;
+  vy: number;
 }
 
 export class Game {
@@ -129,10 +134,17 @@ export class Game {
       const body = frag.body;
       const drag = this.dragOf(frag);
       if (drag) {
-        Matter.Body.setVelocity(body, {
-          x: (drag.x + drag.dx - body.position.x) * 0.35,
-          y: (drag.y + drag.dy - body.position.y) * 0.35,
-        });
+        // 刚体在 onPointerDown 中已切为静态：直接贴住手指位置，
+        // 避免快速拖拽时速度插值造成的滞后；并按指针轨迹记录甩动速度供松手时使用
+        const tx = drag.x + drag.dx;
+        const ty = drag.y + drag.dy;
+        Matter.Body.setPosition(body, { x: tx, y: ty });
+        const dms = Math.max(t - drag.pt, 1);
+        drag.vx = ((tx - drag.px) / dms) * 16.666;
+        drag.vy = ((ty - drag.py) / dms) * 16.666;
+        drag.px = tx;
+        drag.py = ty;
+        drag.pt = t;
       } else {
         const depth = body.position.y - surface;
         const fx = (this.flow * 0.00015 + gust * 0.0005) * body.mass * k;
@@ -192,13 +204,27 @@ export class Game {
     const frag = this.fragmentAt(x, y);
     if (frag) {
       if (frag.slotIndex !== null) this.unslot(frag);
+      // 切为静态刚体：拖拽期间完全跟随手指，不参与重力/浮力模拟
+      Matter.Body.setStatic(frag.body, true);
+      Matter.Body.setAngle(frag.body, 0);
       this.drags.set(e.pointerId, {
         frag,
         dx: frag.body.position.x - x,
         dy: frag.body.position.y - y,
         x,
         y,
+        px: frag.body.position.x,
+        py: frag.body.position.y,
+        pt: this.p.millis(),
+        vx: 0,
+        vy: 0,
       });
+      // 快速拖出画布时仍能收到 pointerup/pointercancel
+      try {
+        this.canvasEl.setPointerCapture(e.pointerId);
+      } catch {
+        /* 某些环境不支持，忽略即可 */
+      }
     }
   }
 
@@ -214,8 +240,34 @@ export class Game {
     const d = this.drags.get(e.pointerId);
     if (!d) return;
     this.drags.delete(e.pointerId);
-    const slot = this.slotAt(d.frag.body.position.x, d.frag.body.position.y);
-    if (slot >= 0) this.placeInSlot(d.frag, slot);
+    try {
+      this.canvasEl.releasePointerCapture(e.pointerId);
+    } catch {
+      /* 忽略 */
+    }
+    this.releaseDrag(d);
+  }
+
+  private releaseDrag(d: Drag): void {
+    const frag = d.frag;
+    // 以手指释放位置（含抓取偏移）判定格子。快速拖拽时手指已到格子、
+    // 刚体此前可能还滞后在半空，用刚体位会判定失败
+    const tx = d.x + d.dx;
+    const ty = d.y + d.dy;
+    const slot = this.slotAt(tx, ty);
+    if (slot >= 0) {
+      this.placeInSlot(frag, slot);
+      return;
+    }
+    // 没放进格子：恢复动态物理，放回释放点并带上甩动速度（限幅，防止穿透）
+    Matter.Body.setStatic(frag.body, false);
+    Matter.Body.setPosition(frag.body, { x: tx, y: ty });
+    const maxV = 18;
+    Matter.Body.setVelocity(frag.body, {
+      x: Math.max(-maxV, Math.min(maxV, d.vx)),
+      y: Math.max(-maxV, Math.min(maxV, d.vy)),
+    });
+    Matter.Body.setAngularVelocity(frag.body, 0);
   }
 
   // ---------- 格子 / 音序器 ----------
@@ -230,6 +282,9 @@ export class Game {
     const occupant = this.slots[i];
     if (occupant && occupant !== frag) {
       this.unslot(occupant, frag.body.position.x, frag.body.position.y);
+      // 被换出的碎片可能同样来自拖拽（静态刚体），恢复动态以便落回河里
+      Matter.Body.setStatic(occupant.body, false);
+      Matter.Body.setVelocity(occupant.body, { x: 0, y: 0 });
     }
     Matter.Composite.remove(this.engine.world, frag.body);
     frag.slotIndex = i;
@@ -270,11 +325,28 @@ export class Game {
 
   private slotAt(x: number, y: number): number {
     const r = this.slotR() * 1.6;
+    let best = -1;
+    let bestD = Infinity;
     for (let i = 0; i < SLOT_COUNT; i++) {
       const s = this.slotPos(i);
       const dx = x - s.x;
       const dy = y - s.y;
+      // 精确落在圆形热区内
       if (dx * dx + dy * dy < r * r) return i;
+      const d = dx * dx + dy * dy;
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    // 快速甩到顶部格子行附近：吸附到水平最近的格子，
+    // 只要纵向在格子带内、横向不超过半个间距
+    const s = this.slotPos(best);
+    if (
+      Math.abs(y - s.y) < this.slotR() * 2.1 &&
+      Math.abs(x - s.x) < this.slotSpacing() * 0.55
+    ) {
+      return best;
     }
     return -1;
   }
